@@ -1,274 +1,204 @@
 # 导入所需的库
 import random
-from shapely.geometry import Point, Polygon, LineString, MultiLineString, MultiPolygon
-from math import cos, sin, pi
+from shapely.geometry import Point, Polygon
+from math import cos, sin, pi  
 from enum import Enum
-import os
-import osmium
 import geopandas as gpd
 from pathlib import Path
+from dataclasses import dataclass
+from typing import List, Tuple
+
+# 配置参数
+@dataclass
+class Config:
+    """程序运行的配置参数"""
+    MIN_DISTANCE: float = 220  # 最小距离
+    MAX_DISTANCE: float = 550  # 最大距离 
+    WATER_BUFFER: float = 40   # 水域缓冲区大小
+    ROAD_BUFFER: float = 60    # 道路缓冲区大小
+    MAX_ATTEMPTS: int = 100000  # 最大尝试次数
+    TARGET_POINTS: int = 500    # 目标生成点数量
+    START_POINT: Tuple[float, float] = (112.998061, 28.17708)  # 起始点坐标
+    OUTPUT_FILE: str = "generated_points-1000-v4.gpkg"  # 输出文件名
+    CIRCLES_FILE: str = "generated_circles-1000-v4.gpkg" # 输出圆形文件名
 
 class ShapeType(Enum):
-    PENTAGON = 'pentagon' 
+    """形状类型枚举"""
+    PENTAGON = 'pentagon'
     CIRCLE = 'circle'
 
-class OSMHandler(osmium.SimpleHandler):
-    def __init__(self):
-        super(OSMHandler, self).__init__()
-        self.buildings = []
-        self.roads = []
-        self.parks = []
-        self.water = []
-        self.nodes = {}
-        self.ways = {}
-
-    def node(self, n):
-        self.nodes[n.id] = (n.lon, n.lat)
-
-    def way(self, w):
-        points = []
-        try:
-            for n in w.nodes:
-                if n.ref in self.nodes:
-                    points.append(self.nodes[n.ref])
-        except osmium.InvalidLocationError:
-            return
-
-        if len(points) < 2:
-            return
-
-        try:
-            # Store the way for potential relation use
-            self.ways[w.id] = w
-
-            if 'building' in w.tags:
-                if len(points) >= 3:
-                    if points[0] == points[-1]:
-                        self.buildings.append(Polygon(points))
-                    else:
-                        points.append(points[0])
-                        self.buildings.append(Polygon(points))
-            elif 'highway' in w.tags:
-                self.roads.append(LineString(points))
-            elif w.tags.get('leisure') == 'park':
-                if len(points) >= 3:
-                    if points[0] == points[-1]:
-                        self.parks.append(Polygon(points))
-                    else:
-                        points.append(points[0])
-                        self.parks.append(Polygon(points))
-            elif w.tags.get('natural') == 'water':
-                if len(points) >= 3:
-                    if points[0] == points[-1]:
-                        self.water.append(Polygon(points))
-                    else:
-                        points.append(points[0])
-                        self.water.append(Polygon(points))
-        except:
-            pass
-
-    def relation(self, r):
-        multipolygon_parts = []
-        multilinestring_parts = []
-        for member in r.members:
-            if member.type == 'w' and member.ref in self.ways:
-                points = []
-                try:
-                    for n in self.ways[member.ref].nodes:
-                        if n.ref in self.nodes:
-                            points.append(self.nodes[n.ref])
-                except osmium.InvalidLocationError:
-                    continue
-
-                if len(points) >= 2:
-                    if member.role == 'outer' or member.role == 'inner':
-                        if points[0] != points[-1]:
-                            points.append(points[0])
-                        multipolygon_parts.append(Polygon(points))
-                    else:
-                        multilinestring_parts.append(LineString(points))
-
-        if len(multipolygon_parts) > 0:
-            try:
-                multipoly = MultiPolygon(multipolygon_parts)
-                if 'building' in r.tags:
-                    self.buildings.append(multipoly)
-                elif r.tags.get('leisure') == 'park':
-                    self.parks.append(multipoly)
-                elif r.tags.get('natural') == 'water':
-                    self.water.append(multipoly)
-            except:
-                pass
-
-        if len(multilinestring_parts) > 0:
-            try:
-                multiline = MultiLineString(multilinestring_parts)
-                if 'highway' in r.tags:
-                    self.roads.append(multiline)
-            except:
-                pass
-
 class GeoDataManager:
-    def __init__(self, osm_file="长沙.osm", output_dir="osm_data"):
-        # 初始化地理数据管理器
-        self.osm_file = Path(osm_file)
-        if not self.osm_file.exists():
-            raise FileNotFoundError(f"OSM file not found: {osm_file}")
-
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
+    """地理数据管理类"""
+    def __init__(self, gpkg_file: str = "osm_data/长沙.gpkg"):
+        self.gpkg_file = Path(gpkg_file)
+        if not self.gpkg_file.exists():
+            raise FileNotFoundError(f"GPKG文件未找到: {gpkg_file}")
         self.data = self._load_data()
 
-    def _load_data(self):
+    def _load_data(self) -> dict:
+        """加载地理数据"""
         try:
-            # 尝试从本地读取数据
-            if self._check_local_files():
-                return self._read_local_files()
-
-            # 如果本地文件不存在，从OSM文件读取并保存
-            return self._read_osm_and_save()
-
-        except Exception as e:
-            print(f"Error loading data: {e}")
-            return {
-                'buildings': gpd.GeoDataFrame(),
-                'roads': gpd.GeoDataFrame(), 
-                'parks': gpd.GeoDataFrame(),
-                'water': gpd.GeoDataFrame()
+            data = {
+                'buildings': self._read_layer('multipolygons', "building IS NOT NULL"),
+                'roads': self._read_layer('lines', "highway IS NOT NULL"), 
+                'parks': self._read_layer('multipolygons', "leisure='park'"),
+                'water': self._read_layer('multipolygons', "natural='water'")
             }
+            return self._transform_crs(data)
+        except Exception as e:
+            print(f"数据加载错误: {e}")
+            return self._create_empty_data()
 
-    def _check_local_files(self):
-        files = ['buildings.gpkg', 'roads.gpkg', 'parks.gpkg', 'water.gpkg']
-        return all((self.output_dir / f).exists() for f in files)
+    def _read_layer(self, layer: str, where_clause: str) -> gpd.GeoDataFrame:
+        """读取指定图层数据"""
+        return gpd.read_file(self.gpkg_file, layer=layer, where=where_clause, on_invalid="ignore")
 
-    def _read_local_files(self):
-        return {
-            'buildings': gpd.read_file(self.output_dir / 'buildings.gpkg'),
-            'roads': gpd.read_file(self.output_dir / 'roads.gpkg'),
-            'parks': gpd.read_file(self.output_dir / 'parks.gpkg'),
-            'water': gpd.read_file(self.output_dir / 'water.gpkg')
-        }
+    def _transform_crs(self, data: dict) -> dict:
+        """转换坐标系统到EPSG:3857"""
+        return {key: df.to_crs(epsg=3857) for key, df in data.items()}
 
-    def _read_osm_and_save(self):
-        handler = OSMHandler()
-        handler.apply_file(str(self.osm_file))
+    def _create_empty_data(self) -> dict:
+        """创建空的数据框"""
+        return {key: gpd.GeoDataFrame() for key in ['buildings', 'roads', 'parks', 'water']}
 
-        buildings = gpd.GeoDataFrame(geometry=handler.buildings, crs='EPSG:4326')
-        roads = gpd.GeoDataFrame(geometry=handler.roads, crs='EPSG:4326')
-        parks = gpd.GeoDataFrame(geometry=handler.parks, crs='EPSG:4326')
-        water = gpd.GeoDataFrame(geometry=handler.water, crs='EPSG:4326')
-
-        # 转换坐标系
-        buildings = buildings.to_crs('EPSG:32650')
-        roads = roads.to_crs('EPSG:32650')
-        parks = parks.to_crs('EPSG:32650')
-        water = water.to_crs('EPSG:32650')
-
-        # 保存到本地
-        buildings.to_file(self.output_dir / 'buildings.gpkg', driver='GPKG')
-        roads.to_file(self.output_dir / 'roads.gpkg', driver='GPKG')
-        parks.to_file(self.output_dir / 'parks.gpkg', driver='GPKG')
-        water.to_file(self.output_dir / 'water.gpkg', driver='GPKG')
-
-        return {
-            'buildings': buildings,
-            'roads': roads,
-            'parks': parks,
-            'water': water
-        }
-
-    def create_buffer(self, data, buffer_size):
-        # 创建缓冲区
+    def create_buffer(self, data: gpd.GeoDataFrame, buffer_size: float) -> gpd.GeoSeries:
+        """创建缓冲区"""
         return data.geometry.buffer(buffer_size)
 
 class ShapeGenerator:
-    def __init__(self, min_dist=200, max_dist=550):
-        # 初始化形状生成器,设置最小和最大距离
-        self.min_dist = min_dist
-        self.max_dist = max_dist
+    """形状生成器类"""
+    def __init__(self, config: Config):
+        self.min_dist = config.MIN_DISTANCE
+        self.max_dist = config.MAX_DISTANCE
 
-    def _create_point(self, current_point):
-        # 根据当前点生成新的随机点
+    def _create_point(self, current_point: Point) -> Tuple[Point, float]:
+        """生成新的点位"""
         angle = random.uniform(0, 360)
         distance = random.uniform(self.min_dist, self.max_dist)
         dx = distance * cos(angle * pi / 180)
         dy = distance * sin(angle * pi / 180)
-        return Point(current_point.x + dx, current_point.y + dy)
+        return Point(current_point.x + dx, current_point.y + dy), distance
 
-    def _create_polygon(self, center, distance, vertices, rotation=0):
-        # 创建多边形
-        points = []
-        for i in range(vertices):
-            angle = 2 * pi * i / vertices + rotation
-            x = center.x + distance * cos(angle)
-            y = center.y + distance * sin(angle)
-            points.append((x, y))
-        # Close the ring by adding the first point again
+    def _create_polygon(self, center: Point, distance: float, vertices: int, rotation: float = 0) -> Polygon:
+        """创建多边形"""
+        points = [(center.x + distance * cos(2 * pi * i / vertices + rotation),
+                  center.y + distance * sin(2 * pi * i / vertices + rotation))
+                 for i in range(vertices)]
         points.append(points[0])
         return Polygon(points)
 
-    def generate_shapes(self, current_point, shape_type=ShapeType.PENTAGON):
-            # 生成形状(五边形或圆形)
-            distance = random.uniform(self.min_dist, self.max_dist)
-            shapes = []
-
-            for i in range(3):
-                if shape_type == ShapeType.PENTAGON:
-                    shapes.append(self._create_polygon(current_point, distance, 5, int(i * 2 * pi / 3)))
-                elif shape_type == ShapeType.CIRCLE:
-                    center_x = current_point.x + distance * cos(i * 2 * pi / 3)
-                    center_y = current_point.y + distance * sin(i * 2 * pi / 3)
-                    circle_center = Point(center_x, center_y)
-                    shapes.append(self._create_polygon(circle_center, distance, 32))
-
-            return shapes
+    def generate_shapes(self, current_point: Point, shape_type: ShapeType = ShapeType.CIRCLE) -> List[Polygon]:
+        """生成形状"""
+        distance = random.uniform(self.min_dist, self.max_dist)
+        if shape_type == ShapeType.PENTAGON:
+            return [self._create_polygon(current_point, distance, 5, int(i * 2 * pi / 3)) 
+                   for i in range(3)]
+        else:
+            return [self._create_polygon(
+                Point(current_point.x + distance * cos(i * 2 * pi / 3),
+                      current_point.y + distance * sin(i * 2 * pi / 3)),
+                distance, 32) for i in range(3)]
 
 class SiteSelection:
-    def __init__(self, buildings_gdf, parks_gdf, water_buffer, road_buffer):
-        # 初始化选址验证器
+    """选址验证类"""
+    def __init__(self, config: Config, buildings_gdf: gpd.GeoDataFrame, 
+                 parks_gdf: gpd.GeoDataFrame, water_buffer: gpd.GeoSeries, 
+                 road_buffer: gpd.GeoSeries):
         self.buildings_gdf = buildings_gdf
         self.parks_gdf = parks_gdf
         self.water_buffer = water_buffer
         self.road_buffer = road_buffer
+        self.min_dist = config.MIN_DISTANCE
+        self.max_dist = config.MAX_DISTANCE
 
-    def is_valid_point(self, point, generated_polygons):
-        # 验证点的有效性
-        in_building = self.buildings_gdf.geometry.contains(point).any()
-        in_park = self.parks_gdf.geometry.contains(point).any()
-        not_in_water = not any(buffer.contains(point) for buffer in self.water_buffer)
-        not_in_road = not any(buffer.contains(point) for buffer in self.road_buffer)
-        not_in_existing = not any(polygon.contains(point) for polygon in generated_polygons)
+    def is_valid_point(self, point: Point, valid_points: List[Point], circles: List[Tuple[Polygon, Point]]) -> bool:
+        """验证点位是否有效"""
+        return (self._check_basic_conditions(point) and 
+                self._check_circle_conditions(point, circles) and
+                self._check_min_distance(point, valid_points))
 
-        return (in_building or in_park) and not_in_water and not_in_road and not_in_existing
+    def _check_basic_conditions(self, point: Point) -> bool:
+        """检查基本条件"""
+        return ((self.buildings_gdf.geometry.contains(point).any() or 
+                self.parks_gdf.geometry.contains(point).any()) and
+                not any(buffer.contains(point) for buffer in self.water_buffer) and
+                not any(buffer.contains(point) for buffer in self.road_buffer))
+
+    def _check_circle_conditions(self, point: Point, circles: List[Tuple[Polygon, Point]]) -> bool:
+        """检查圆形条件"""
+        if not circles:
+            return True
+        return not any(self._is_invalid_circle(point, circle, center) 
+                      for circle, center in circles)
+
+    def _check_min_distance(self, point: Point, valid_points: List[Point]) -> bool:
+        """检查是否满足最小距离要求"""
+        return all(point.distance(existing_point) >= self.min_dist for existing_point in valid_points)
+
+    def _is_invalid_circle(self, point: Point, circle: Polygon, center: Point) -> bool:
+        """检查是否在无效圆形范围内"""
+        if circle.contains(point):
+            dist = point.distance(center)
+            return dist < self.min_dist or dist > self.max_dist
+        return False
 
 def main():
-    # 主函数
-    geo_manager = GeoDataManager("osm_data/长沙.osm")
-    data = geo_manager.data
+    """主函数"""
+    try:
+        config = Config()
+        geo_manager = GeoDataManager()
+        data = geo_manager.data
 
-    # for o in osmium.FileProcessor('osm_data/长沙.osm', osmium.osm.NODE):
-    #     print(f"Node {o.id}: lat = {o.lat} lon = {o.lon}")
+        # 创建缓冲区
+        water_buffer = geo_manager.create_buffer(data['water'], config.WATER_BUFFER)
+        road_buffer = geo_manager.create_buffer(data['roads'], config.ROAD_BUFFER)
+        print("水域和道路缓冲区生成完成")
 
-    # # 创建水域和道路的缓冲区
-    # water_buffer = geo_manager.create_buffer(data['water'], 30)
-    # road_buffer = geo_manager.create_buffer(data['roads'], 50)
-    # print("水域和道路缓冲区生成完成")
+        # 初始化验证器和形状生成器
+        validator = SiteSelection(config, data['buildings'], data['parks'], water_buffer, road_buffer)
+        shape_gen = ShapeGenerator(config)
 
-    # validator = SiteSelection(data['buildings'], data['parks'], water_buffer, road_buffer)
-    # shape_gen = ShapeGenerator()
+        # 设置起始点和初始化数据结构
+        start_point = gpd.GeoSeries([Point(config.START_POINT)], crs=4326).to_crs(3857)[0]
+        valid_points, circles = [start_point], []
 
-    # # 设置起始点并转换到UTM投影
-    # start_point = Point(112.9793, 28.1989)
-    # generated_polygons = []
+        # 生成第一个圆
+        first_radius = random.uniform(config.MIN_DISTANCE, config.MAX_DISTANCE)
+        circles.append((start_point.buffer(first_radius), start_point))
 
-    # # 生成有效点和形状
-    # while True:
-    #     new_point = shape_gen._create_point(start_point)
-    #     if validator.is_valid_point(new_point, generated_polygons):
-    #         shapes = shape_gen.generate_shapes(new_point, ShapeType.PENTAGON)
-    #         generated_polygons.extend(shapes)
-    #         print(f"生成的下一个点坐标: {new_point.x}, {new_point.y}")
-    #         break
+        print(f"生成的第 1 个点坐标: {gpd.GeoSeries([start_point], crs=3857).to_crs(4326)[0].coords[0]}")
+
+        # 生成其他点位
+        attempts = 0
+        while len(valid_points) < config.TARGET_POINTS and attempts < config.MAX_ATTEMPTS:
+            reference_point = random.choice(valid_points)
+            new_point, distance = shape_gen._create_point(reference_point)
+
+            if validator.is_valid_point(new_point, valid_points, circles):
+                valid_points.append(new_point)
+                circles.append((new_point.buffer(distance), new_point))
+
+                display_point = gpd.GeoSeries([new_point], crs=3857).to_crs(4326)[0]
+                print(f"生成的第 {len(valid_points)} 个点坐标: {display_point.x}, {display_point.y}")
+
+            attempts += 1
+
+        if attempts >= config.MAX_ATTEMPTS:
+            print(f"达到最大尝试次数 {config.MAX_ATTEMPTS}，共生成 {len(valid_points)} 个有效点")
+
+        # 保存点位结果
+        points_gdf = gpd.GeoDataFrame(geometry=valid_points, crs=3857).to_crs(4326)
+        points_gdf.to_file(config.OUTPUT_FILE, driver="GPKG", layer="points")
+        print(f"已生成{len(valid_points)}个点并保存到 {config.OUTPUT_FILE}")
+
+        # 保存圆形结果
+        circles_geometry = [circle for circle, _ in circles]
+        circles_gdf = gpd.GeoDataFrame(geometry=circles_geometry, crs=3857).to_crs(4326)
+        circles_gdf.to_file(config.CIRCLES_FILE, driver="GPKG", layer="circles")
+        print(f"已生成{len(circles)}个圆并保存到 {config.CIRCLES_FILE}")
+
+    except Exception as e:
+        print(f"程序运行错误: {e}")
 
 if __name__ == "__main__":
     main()
