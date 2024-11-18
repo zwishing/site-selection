@@ -3,40 +3,63 @@ import random
 from shapely.geometry import Point, Polygon
 from math import cos, sin, pi  
 from enum import Enum
-import geopandas as gpd
+import geopandas as gpd 
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Tuple
+from shapely.ops import unary_union
+import pandas as pd
 
-# 配置参数
-@dataclass
-class Config:
-    """程序运行的配置参数"""
-    MIN_DISTANCE: float = 220  # 最小距离
-    MAX_DISTANCE: float = 550  # 最大距离 
-    WATER_BUFFER: float = 40   # 水域缓冲区大小
-    ROAD_BUFFER: float = 60    # 道路缓冲区大小
-    MAX_ATTEMPTS: int = 100000  # 最大尝试次数
-    TARGET_POINTS: int = 500    # 目标生成点数量
-    START_POINT: Tuple[float, float] = (112.998061, 28.17708)  # 起始点坐标
-    OUTPUT_FILE: str = "generated_points-1000-v4.gpkg"  # 输出文件名
-    CIRCLES_FILE: str = "generated_circles-1000-v4.gpkg" # 输出圆形文件名
+class PointGeneratorConfig:
+    """点位生成器配置"""
+    def __init__(self,
+                 min_distance: float = 220,     # 最小距离
+                 max_distance: float = 550,     # 最大距离
+                 water_buffer: float = 40,      # 水域缓冲区
+                 road_buffer: float = 60,       # 道路缓冲区
+                 max_attempts: int = 100000,    # 最大尝试次数 
+                 target_points: int = 500,      # 目标点数量
+                 start_point: Tuple[float,float] = (112.998061, 28.17708), # 起始点
+                 output_dir: str = "output"     # 输出目录
+                ):
+        self.min_distance = min_distance
+        self.max_distance = max_distance  
+        self.water_buffer = water_buffer
+        self.road_buffer = road_buffer
+        self.max_attempts = max_attempts
+        self.target_points = target_points
+        self.start_point = start_point
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(exist_ok=True)
 
-class ShapeType(Enum):
-    """形状类型枚举"""
-    PENTAGON = 'pentagon'
-    CIRCLE = 'circle'
+    @property    
+    def points_file(self) -> str:
+        return str(self.output_dir / "points.gpkg")
+
+    @property
+    def circles_file(self) -> str:
+        return str(self.output_dir / "circles.gpkg")
+
+    @property  
+    def union_file(self) -> str:
+        return str(self.output_dir / "union.gpkg")
 
 class GeoDataManager:
     """地理数据管理类"""
-    def __init__(self, gpkg_file: str = "osm_data/长沙.gpkg"):
+    def __init__(self, gpkg_file: str, config: PointGeneratorConfig):
         self.gpkg_file = Path(gpkg_file)
         if not self.gpkg_file.exists():
             raise FileNotFoundError(f"GPKG文件未找到: {gpkg_file}")
+        self.config = config    
         self.data = self._load_data()
 
+        # 创建各类空间对象
+        self.buildings = self.data['buildings']
+        self.parks = self.data['parks']
+        self.roads = gpd.GeoDataFrame(geometry=self.data['roads'].buffer(config.road_buffer), crs=3857)
+        self.water = gpd.GeoDataFrame(geometry=self.data['water'].buffer(config.water_buffer), crs=3857)
+
     def _load_data(self) -> dict:
-        """加载地理数据"""
         try:
             data = {
                 'buildings': self._read_layer('multipolygons', "building IS NOT NULL"),
@@ -50,153 +73,118 @@ class GeoDataManager:
             return self._create_empty_data()
 
     def _read_layer(self, layer: str, where_clause: str) -> gpd.GeoDataFrame:
-        """读取指定图层数据"""
         return gpd.read_file(self.gpkg_file, layer=layer, where=where_clause, on_invalid="ignore")
 
     def _transform_crs(self, data: dict) -> dict:
-        """转换坐标系统到EPSG:3857"""
-        return {key: df.to_crs(epsg=3857) for key, df in data.items()}
+        return {key: gdf.to_crs(epsg=3857) for key, gdf in data.items()}
 
     def _create_empty_data(self) -> dict:
-        """创建空的数据框"""
         return {key: gpd.GeoDataFrame() for key in ['buildings', 'roads', 'parks', 'water']}
 
-    def create_buffer(self, data: gpd.GeoDataFrame, buffer_size: float) -> gpd.GeoSeries:
-        """创建缓冲区"""
-        return data.geometry.buffer(buffer_size)
+    def create_buffer(self, data: gpd.GeoDataFrame, buffer_size: float) -> gpd.GeoDataFrame:
+        return gpd.GeoDataFrame(geometry=data.geometry.buffer(buffer_size), crs=data.crs)
 
-class ShapeGenerator:
-    """形状生成器类"""
-    def __init__(self, config: Config):
-        self.min_dist = config.MIN_DISTANCE
-        self.max_dist = config.MAX_DISTANCE
+class PointGenerator:
+    """点位生成器"""
+    def __init__(self, config: PointGeneratorConfig, geo_manager: GeoDataManager):
+        self.config = config
+        self.geo_manager = geo_manager
 
-    def _create_point(self, current_point: Point) -> Tuple[Point, float]:
-        """生成新的点位"""
-        angle = random.uniform(0, 360)
-        distance = random.uniform(self.min_dist, self.max_dist)
-        dx = distance * cos(angle * pi / 180)
-        dy = distance * sin(angle * pi / 180)
-        return Point(current_point.x + dx, current_point.y + dy), distance
+    def create_ring(self, point: Point) -> gpd.GeoDataFrame:
+        outer_circle = gpd.GeoDataFrame(geometry=[point.buffer(self.config.max_distance)], crs=3857)
+        inner_circle = gpd.GeoDataFrame(geometry=[point.buffer(self.config.min_distance)], crs=3857)
+        diff = gpd.overlay(outer_circle, inner_circle, how='difference')
+        if not diff.empty:
+            return diff
+        raise Exception("无法创建有效的环形区域")
 
-    def _create_polygon(self, center: Point, distance: float, vertices: int, rotation: float = 0) -> Polygon:
-        """创建多边形"""
-        points = [(center.x + distance * cos(2 * pi * i / vertices + rotation),
-                  center.y + distance * sin(2 * pi * i / vertices + rotation))
-                 for i in range(vertices)]
-        points.append(points[0])
-        return Polygon(points)
+    def get_random_point(self, search_area: gpd.GeoDataFrame) -> Point:
+        minx, miny, maxx, maxy = search_area.total_bounds
+        attempts = 0
+        while attempts < self.config.max_attempts:
+            point = gpd.GeoDataFrame(
+                geometry=[Point(random.uniform(minx, maxx), random.uniform(miny, maxy))],
+                crs=3857
+            )
 
-    def generate_shapes(self, current_point: Point, shape_type: ShapeType = ShapeType.CIRCLE) -> List[Polygon]:
-        """生成形状"""
-        distance = random.uniform(self.min_dist, self.max_dist)
-        if shape_type == ShapeType.PENTAGON:
-            return [self._create_polygon(current_point, distance, 5, int(i * 2 * pi / 3)) 
-                   for i in range(3)]
-        else:
-            return [self._create_polygon(
-                Point(current_point.x + distance * cos(i * 2 * pi / 3),
-                      current_point.y + distance * sin(i * 2 * pi / 3)),
-                distance, 32) for i in range(3)]
+            # 使用空间操作进行检查
+            if (gpd.tools.sjoin(point, search_area, how="inner", predicate="within").shape[0] > 0 and
+                (gpd.tools.sjoin(point, self.geo_manager.buildings, how="inner", predicate="within").shape[0] > 0 or
+                 gpd.tools.sjoin(point, self.geo_manager.parks, how="inner", predicate="within").shape[0] > 0) and
+                gpd.tools.sjoin(point, self.geo_manager.roads, how="inner", predicate="within").shape[0] == 0 and
+                gpd.tools.sjoin(point, self.geo_manager.water, how="inner", predicate="within").shape[0] == 0):
+                return point.geometry.iloc[0]
+            attempts += 1
+        raise Exception("无法在有效区域内找到合适的点位")
 
-class SiteSelection:
-    """选址验证类"""
-    def __init__(self, config: Config, buildings_gdf: gpd.GeoDataFrame, 
-                 parks_gdf: gpd.GeoDataFrame, water_buffer: gpd.GeoSeries, 
-                 road_buffer: gpd.GeoSeries):
-        self.buildings_gdf = buildings_gdf
-        self.parks_gdf = parks_gdf
-        self.water_buffer = water_buffer
-        self.road_buffer = road_buffer
-        self.min_dist = config.MIN_DISTANCE
-        self.max_dist = config.MAX_DISTANCE
+    def generate(self):
+        """生成点位"""
+        try:
+            # 创建起始点GeoDataFrame
+            start_point = gpd.GeoDataFrame(
+                geometry=[Point(self.config.start_point)], 
+                crs=4326
+            ).to_crs(3857).geometry.iloc[0]
 
-    def is_valid_point(self, point: Point, valid_points: List[Point], circles: List[Tuple[Polygon, Point]]) -> bool:
-        """验证点位是否有效"""
-        return (self._check_basic_conditions(point) and 
-                self._check_circle_conditions(point, circles) and
-                self._check_min_distance(point, valid_points))
+            valid_points_gdf = gpd.GeoDataFrame(geometry=[start_point], crs=3857)
 
-    def _check_basic_conditions(self, point: Point) -> bool:
-        """检查基本条件"""
-        return ((self.buildings_gdf.geometry.contains(point).any() or 
-                self.parks_gdf.geometry.contains(point).any()) and
-                not any(buffer.contains(point) for buffer in self.water_buffer) and
-                not any(buffer.contains(point) for buffer in self.road_buffer))
+            # 初始圆环
+            first_ring = self.create_ring(start_point)
+            rings_gdf = first_ring 
+            union_area = gpd.GeoDataFrame(geometry=rings_gdf.geometry, crs=3857)
 
-    def _check_circle_conditions(self, point: Point, circles: List[Tuple[Polygon, Point]]) -> bool:
-        """检查圆形条件"""
-        if not circles:
-            return True
-        return not any(self._is_invalid_circle(point, circle, center) 
-                      for circle, center in circles)
+            # 生成点位
+            for i in range(1, self.config.target_points):
+                new_point = self.get_random_point(union_area)
+                valid_points_gdf = pd.concat([
+                    valid_points_gdf, 
+                    gpd.GeoDataFrame(geometry=[new_point], crs=3857)
+                ])
 
-    def _check_min_distance(self, point: Point, valid_points: List[Point]) -> bool:
-        """检查是否满足最小距离要求"""
-        return all(point.distance(existing_point) >= self.min_dist for existing_point in valid_points)
+                new_ring = self.create_ring(new_point)
+                # 修改union计算方式
+                # 先计算两个圆环的并集 
+                temp_union = gpd.overlay(union_area, new_ring, how='union')
+                # 合并相连的geometry
+                temp_union = gpd.GeoDataFrame(geometry=[unary_union(temp_union.geometry)], crs=3857)
+                # 计算两个内圈
+                old_inner = gpd.GeoDataFrame(geometry=[Point(p).buffer(self.config.min_distance) for p in valid_points_gdf.geometry[:-1]], crs=3857)
+                new_inner = gpd.GeoDataFrame(geometry=[new_point.buffer(self.config.min_distance)], crs=3857)
+                # 从并集中去除内圈区域
+                union_area = gpd.overlay(temp_union, old_inner, how='difference',keep_geom_type=True)
+                union_area = gpd.overlay(union_area, new_inner, how='difference',keep_geom_type=True)
 
-    def _is_invalid_circle(self, point: Point, circle: Polygon, center: Point) -> bool:
-        """检查是否在无效圆形范围内"""
-        if circle.contains(point):
-            dist = point.distance(center)
-            return dist < self.min_dist or dist > self.max_dist
-        return False
+                display_point = gpd.GeoDataFrame(
+                    geometry=[new_point], 
+                    crs=3857
+                ).to_crs(4326).geometry.iloc[0]
+                print(f"生成的第 {i+1} 个点坐标: {display_point.x}, {display_point.y}")
+
+            # 保存结果
+            valid_points_gdf.to_crs(4326).to_file(
+                self.config.points_file, 
+                driver="GPKG", 
+                layer="points"
+            )
+            print(f"已生成{len(valid_points_gdf)}个点并保存到 {self.config.points_file}")
+
+            union_area.to_crs(4326).to_file(
+                self.config.union_file, 
+                driver="GPKG", 
+                layer="union"
+            )
+            print(f"已保存并集区域到 {self.config.union_file}")
+
+        except Exception as e:
+            print(f"生成点位错误: {e}")
 
 def main():
     """主函数"""
     try:
-        config = Config()
-        geo_manager = GeoDataManager()
-        data = geo_manager.data
-
-        # 创建缓冲区
-        water_buffer = geo_manager.create_buffer(data['water'], config.WATER_BUFFER)
-        road_buffer = geo_manager.create_buffer(data['roads'], config.ROAD_BUFFER)
-        print("水域和道路缓冲区生成完成")
-
-        # 初始化验证器和形状生成器
-        validator = SiteSelection(config, data['buildings'], data['parks'], water_buffer, road_buffer)
-        shape_gen = ShapeGenerator(config)
-
-        # 设置起始点和初始化数据结构
-        start_point = gpd.GeoSeries([Point(config.START_POINT)], crs=4326).to_crs(3857)[0]
-        valid_points, circles = [start_point], []
-
-        # 生成第一个圆
-        first_radius = random.uniform(config.MIN_DISTANCE, config.MAX_DISTANCE)
-        circles.append((start_point.buffer(first_radius), start_point))
-
-        print(f"生成的第 1 个点坐标: {gpd.GeoSeries([start_point], crs=3857).to_crs(4326)[0].coords[0]}")
-
-        # 生成其他点位
-        attempts = 0
-        while len(valid_points) < config.TARGET_POINTS and attempts < config.MAX_ATTEMPTS:
-            reference_point = random.choice(valid_points)
-            new_point, distance = shape_gen._create_point(reference_point)
-
-            if validator.is_valid_point(new_point, valid_points, circles):
-                valid_points.append(new_point)
-                circles.append((new_point.buffer(distance), new_point))
-
-                display_point = gpd.GeoSeries([new_point], crs=3857).to_crs(4326)[0]
-                print(f"生成的第 {len(valid_points)} 个点坐标: {display_point.x}, {display_point.y}")
-
-            attempts += 1
-
-        if attempts >= config.MAX_ATTEMPTS:
-            print(f"达到最大尝试次数 {config.MAX_ATTEMPTS}，共生成 {len(valid_points)} 个有效点")
-
-        # 保存点位结果
-        points_gdf = gpd.GeoDataFrame(geometry=valid_points, crs=3857).to_crs(4326)
-        points_gdf.to_file(config.OUTPUT_FILE, driver="GPKG", layer="points")
-        print(f"已生成{len(valid_points)}个点并保存到 {config.OUTPUT_FILE}")
-
-        # 保存圆形结果
-        circles_geometry = [circle for circle, _ in circles]
-        circles_gdf = gpd.GeoDataFrame(geometry=circles_geometry, crs=3857).to_crs(4326)
-        circles_gdf.to_file(config.CIRCLES_FILE, driver="GPKG", layer="circles")
-        print(f"已生成{len(circles)}个圆并保存到 {config.CIRCLES_FILE}")
-
+        config = PointGeneratorConfig(target_points=1000)
+        geo_manager = GeoDataManager("osm_data/长沙.gpkg", config)
+        generator = PointGenerator(config, geo_manager)
+        generator.generate()
     except Exception as e:
         print(f"程序运行错误: {e}")
 
