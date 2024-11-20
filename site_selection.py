@@ -1,5 +1,5 @@
-from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from dataclasses import dataclass, field
+from typing import Any, List, Tuple, Optional
 from pathlib import Path
 from enum import Enum, auto
 import random
@@ -10,15 +10,28 @@ from tqdm import tqdm
 from shapely.ops import unary_union
 
 @dataclass
+class Fields:
+    field_name: str
+    default_value: Optional[object] = None
+    dtype: Optional[str] = None
+
+@dataclass
 class GeneratorConfig:
     """生成器配置"""
-    min_distance: float = 200
-    max_distance: float = 550
-    max_attempts: int = 100000
+    min_distance: float = 225 
+    max_distance: float = 575
+    max_attempts: int = 1000000
     target_points: int = 300
     start_point: Tuple[float, float] = (112.998061, 28.17708)
     output_dir: str = "output"
     score_threshold: float = 0.5
+    fields: List[Fields] = field(default_factory=lambda: [
+        Fields(field_name="site_id"),
+        Fields(field_name="site_longitude"),
+        Fields(field_name="site_latitude"),
+        Fields(field_name="site_height"),
+        Fields(field_name="site_sector", default_value=3),
+    ])
 
 
 class ConstraintType(Enum):
@@ -130,7 +143,7 @@ class PointGenerator:
             attempts += 1
         return None
 
-    def generate(self):
+    def generate(self)->gpd.GeoDataFrame:
         """生成点位"""
         try:
             # 创建起始点
@@ -142,7 +155,7 @@ class PointGenerator:
             valid_points = [start_point]
             union_area = self.create_ring(start_point)
             
-            with tqdm(total=self.config.target_points-1) as pbar:
+            with tqdm(total=self.config.target_points,initial=1) as pbar:
                 while len(valid_points) < self.config.target_points:
                     new_point = self.get_random_point(union_area)
                     if new_point is None:
@@ -167,31 +180,113 @@ class PointGenerator:
 
             # 保存结果
             points_gdf = gpd.GeoDataFrame(geometry=valid_points, crs=3857)
-            points_gdf.to_crs(4326).to_file(
-                f"{self.config.output_dir}/points.gpkg",
-                driver="GPKG",
-                layer="points"
-            )
-            
             union_area.to_crs(4326).to_file(
                 f"{self.config.output_dir}/union.gpkg",
                 driver="GPKG",
                 layer="union"
             )
+            return points_gdf.to_crs(4326)
+            # points_gdf.to_crs(4326).to_file(
+            #     f"{self.config.output_dir}/points.gpkg",
+            #     driver="GPKG",
+            #     layer="points"
+            # )
             
-            print(f"\n已生成 {len(valid_points)} 个点位")
+            
+            
+            # print(f"\n已生成 {len(valid_points)} 个点位")
             
         except Exception as e:
             print(f"生成点位错误: {e}")
-            raise
+            return points_gdf.to_crs(4326)
+        
+class FieldsAdd:
+    def __init__(self, gdf: gpd.GeoDataFrame, config: GeneratorConfig):
+        """
+        初始化Fields管理器
+        
+        :param gdf: 地理数据框
+        :param config: 字段配置列表
+        """
+        self.gdf = gdf
+        self.config = config.fields
+        
+        # 自动识别ID和高度字段
+        self.id_field = next((field.field_name for field in self.config if "id" in field.field_name.lower()), "site_id")
+        self.height_field = next((field.field_name for field in self.config if "height" in field.field_name.lower()), "site_height")
+        self.longitude_field = next((field.field_name for field in self.config if "longitude" in field.field_name.lower()), "site_longitude")
+        self.latitude_field = next((field.field_name for field in self.config if "latitude" in field.field_name.lower()), "site_latitude")
 
+    def add_id(self, start: int = 0):
+        """
+        添加自增ID字段
+        
+        :param start: ID起始值
+        """
+        self.gdf[self.id_field] = range(start, len(self.gdf) + start)
+
+    def add_height(self, height_gdf: gpd.GeoDataFrame, height_field: str = "height"):
+        """
+        从高度数据中添加高度信息
+        
+        :param height_gdf: 包含高度信息的地理数据框
+        :param height_field: 高度字段名
+        """
+        if height_field not in height_gdf.columns:
+            raise ValueError(f"指定的字段 {height_field} 在高度数据中不存在")
+
+        height_gdf = height_gdf.to_crs(self.gdf.crs)
+        joined_gdf = gpd.sjoin(self.gdf, height_gdf, how="left", predicate="within")
+        self.gdf[self.height_field] = joined_gdf[height_field]
+
+    def add_coordinates(self):
+        """添加经纬度坐标字段"""
+        self.gdf[self.longitude_field] = self.gdf.geometry.x
+        self.gdf[self.latitude_field] = self.gdf.geometry.y
+
+    def add_custom_fields(self):
+        """
+        根据配置添加自定义字段
+        """
+        for field_config in self.config:
+            if field_config.field_name not in self.gdf.columns:
+                if field_config.default_value is None:
+                    # 使用dtype创建空字段
+                    self.gdf[field_config.field_name] = field_config.dtype()
+                else:
+                    # 使用默认值填充
+                    self.gdf[field_config.field_name] = field_config.default_value
+
+    def apply_fields(self)->gpd.GeoDataFrame:
+        """
+        应用所有字段处理方法
+        """
+        self.add_id()  # 添加ID字段
+        self.add_coordinates()  # 添加坐标字段
+        self.add_custom_fields()  # 添加其他自定义字段
+        return self.gdf
+
+
+def category_num(value):
+    """
+    """
+    if value=="城区":
+        return 9
+    elif value == "县城":
+        return 6
+    elif value == "郊区":
+        return 4
+    elif value=="农村":
+        return 2
+    
 def main():
     """主函数"""
     try:
         # 设置配置参数
         config = GeneratorConfig(
-            target_points=200,
-            output_dir="雨花区-200"
+            target_points=1112,
+            output_dir="id-9",
+            start_point=(112.982318, 28.188614)
         )
         
         # 初始化管理器和读取数据
@@ -216,7 +311,7 @@ def main():
         )
 
         authority_boundary = boundary.read_feature(
-            where="name='雨花区'"
+            where="id=9"
         )
 
         
@@ -256,8 +351,18 @@ def main():
         # 创建并运行生成器
         print("开始生成点位...")
         generator = PointGenerator(config, validator)
-        generator.generate()
-        
+        point_gdf = generator.generate()
+
+        field=FieldsAdd(point_gdf,config=config)
+        field.add_height(gpd.read_file("./osm_data/长沙-20241111-v2.gpkg"))
+        gdf=field.apply_fields()
+        gdf.to_crs(4326).to_file(
+                f"{config.output_dir}/points.gpkg",
+                driver="GPKG",
+                layer="points"
+            )
+
+
     except Exception as e:
         print(f"程序运行错误: {e}")
         raise
