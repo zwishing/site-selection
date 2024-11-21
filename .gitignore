@@ -1,7 +1,4 @@
 generated*
 .venv/
-base/
-id-9/
-osm_data/*
-output/*
-雨花区-200/
+base/*
+id-9/*

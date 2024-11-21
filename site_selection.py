@@ -35,13 +35,13 @@ class GeneratorConfig:
         Fields(field_name="site_sector", default_value=3),
     ])
 
-@dataclass
+
 class ConstraintType(Enum):
     """约束类型"""
     MUST_WITHIN = auto()
     MUST_OUTSIDE = auto()
     PREFER_WITHIN = auto()
-    # PREFER_OUTSIDE = auto()
+    PREFER_OUTSIDE = auto()
 
 @dataclass
 class SpatialConstraint:
@@ -73,7 +73,6 @@ class ConstraintValidator:
             if self.valid_area is None:
                 raise ValueError("MUST_OUTSIDE约束需要先定义一个有效区域范围")
             self.valid_area = self.valid_area.overlay(constraint_gdf, how='difference')
-            self.valid_area.to_file(f"{self.config.output_dir}/valid_area.gpkg", driver="GPKG", layer="valid_area")
         elif constraint.constraint_type == ConstraintType.PREFER_WITHIN:
             self.prefer_areas.append((constraint.priority, constraint_gdf))
             
@@ -126,7 +125,7 @@ class GeoFeatureManager:
             raise FileNotFoundError(f"矢量数据文件未找到: {file}")
         
     def read_feature(self, 
-                    where: str, 
+                    where: Optional[str]=None, 
                     layer: Optional[str] = None, 
                     buffer_size: Optional[float] = None) -> gpd.GeoDataFrame:
         """读取地理要素"""
@@ -195,7 +194,6 @@ class PointGenerator:
         """生成点位"""
         try:
             valid_area = self.validator.get_valid_area()
-            valid_area.to_file(f"{self.config.output_dir}/valid_area1.gpkg", driver="GPKG", layer="valid_area")  
             valid_points = []
             
             # 根据是否设置目标点位数创建不同格式的进度条
@@ -229,9 +227,11 @@ class PointGenerator:
                 pbar.update(1)
             
             pbar.close()
-            print(f"\n成功生成 {len(valid_points)} 个点位")
+
             valid_area.to_file(f"{self.config.output_dir}/valid_area.gpkg", driver="GPKG", layer="valid_area")  
+
             points_gdf = gpd.GeoDataFrame(geometry=valid_points, crs=3857)
+
             return points_gdf.to_crs(4326)
                 
         except Exception as e:
@@ -314,17 +314,18 @@ def main():
         # 设置配置参数
         config = GeneratorConfig(
             # target_points=200,
-            output_dir="雨花区-1",
+            output_dir="id-9",
         )
         
         # 初始化管理器和读取数据
+        buildings = GeoFeatureManager("/mnt/d/wang/长沙建筑数据/长沙建筑轮廓数据/长沙-20241111-v2.gpkg")
         geo_manager = GeoFeatureManager("osm_data/长沙osm-面.gpkg")
         line = GeoFeatureManager("osm_data/长沙osm-多线.gpkg")
         boundary = GeoFeatureManager("osm_data/长沙市区县.shp")
         
         print("正在读取地理数据...")
-        buildings = geo_manager.read_feature(
-            where="building IS NOT NULL"
+        buildings = buildings.read_feature(
+            # where="building IS NOT NULL"
         )
         parks = geo_manager.read_feature(
             where="leisure='park'"
@@ -339,7 +340,7 @@ def main():
         )
 
         authority_boundary = boundary.read_feature(
-            where="name='雨花区'"
+            where="id=9"
         )
 
         
@@ -381,10 +382,10 @@ def main():
         generator = PointGenerator(config, validator)
         point_gdf = generator.generate()
 
-        # field=FieldsGenerator(point_gdf,config=config)
-        # field.add_height(gpd.read_file("./osm_data/长沙-20241111-v2.gpkg"))
-        # gdf=field.apply_fields()
-        point_gdf.to_crs(4326).to_file(
+        field=FieldsGenerator(point_gdf,config=config)
+        field.add_height(gpd.read_file("./osm_data/长沙-20241111-v2.gpkg"))
+        gdf=field.apply_fields()
+        gdf.to_crs(4326).to_file(
                 f"{config.output_dir}/points.gpkg",
                 driver="GPKG",
                 layer="points"
