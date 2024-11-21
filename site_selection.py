@@ -10,6 +10,8 @@ from tqdm import tqdm
 from shapely.ops import unary_union
 import numpy as np
 
+CRS = 3857
+
 @dataclass
 class Fields:
     field_name: str
@@ -22,8 +24,7 @@ class GeneratorConfig:
     min_distance: float = 230 
     max_distance: float = 580
     max_attempts: int = 1000000
-    target_points: int = 300
-    start_point: Tuple[float, float] = (112.998061, 28.17708)
+    target_points: Optional[int] = None
     output_dir: str = "output"
     score_threshold: float = 0.5
     fields: List[Fields] = field(default_factory=lambda: [
@@ -34,13 +35,13 @@ class GeneratorConfig:
         Fields(field_name="site_sector", default_value=3),
     ])
 
-
+@dataclass
 class ConstraintType(Enum):
     """约束类型"""
     MUST_WITHIN = auto()
     MUST_OUTSIDE = auto()
     PREFER_WITHIN = auto()
-    PREFER_OUTSIDE = auto()
+    # PREFER_OUTSIDE = auto()
 
 @dataclass
 class SpatialConstraint:
@@ -48,42 +49,74 @@ class SpatialConstraint:
     name: str
     geometry: gpd.GeoDataFrame
     constraint_type: ConstraintType
-    weight: float = 1.0
-
-    def check_point(self, point: Point) -> Tuple[bool, float]:
-        """检查点是否满足约束"""
-        points_gdf = gpd.GeoDataFrame({'geometry': [point]}, crs=self.geometry.crs)
-        # 空间连接，找出点在哪些面内
-        within = not gpd.sjoin(points_gdf, self.geometry, predicate='within').empty
-        
-        if self.constraint_type == ConstraintType.MUST_WITHIN:
-            return within, 1.0 if within else 0.0
-        elif self.constraint_type == ConstraintType.MUST_OUTSIDE:
-            return not within, 1.0 if not within else 0.0
-        elif self.constraint_type == ConstraintType.PREFER_WITHIN:
-            return True, self.weight if within else 0.0
-        else:  # PREFER_OUTSIDE
-            return True, self.weight if not within else 0.0
+    priority: int = 0  # 添加优先级字段，数字越小优先级越高
 
 class ConstraintValidator:
     """约束验证器"""
     def __init__(self):
-        self.constraints: List[SpatialConstraint] = []
+        # self.constraints: List[SpatialConstraint] = []
+        self.valid_area: Optional[gpd.GeoDataFrame] = None
+        self.prefer_areas: List[gpd.GeoDataFrame] = []  # 存储按优先级排序的区域
         
     def add_constraint(self, constraint: SpatialConstraint):
-        self.constraints.append(constraint)
-    
-    def validate(self, point: Point) -> Tuple[bool, float]:
-        """验证点位"""
-        score = 0.0
+        """添加并处理约束"""
+        # 只保留geometry列，删除其他属性列
+        constraint_gdf = gpd.GeoDataFrame(geometry=constraint.geometry.geometry, crs=constraint.geometry.crs).to_crs(CRS)
         
-        for constraint in self.constraints:
-            valid, constraint_score = constraint.check_point(point)
-            if not valid:
-                return False, 0.0
-            score += constraint_score
+        # self.constraints.append(constraint)
+        if constraint.constraint_type == ConstraintType.MUST_WITHIN:
+            if self.valid_area is None:
+                self.valid_area = constraint_gdf
+            else:
+                self.valid_area = self.valid_area.overlay(constraint_gdf, how='intersection')
+        elif constraint.constraint_type == ConstraintType.MUST_OUTSIDE:
+            if self.valid_area is None:
+                raise ValueError("MUST_OUTSIDE约束需要先定义一个有效区域范围")
+            self.valid_area = self.valid_area.overlay(constraint_gdf, how='difference')
+            self.valid_area.to_file(f"{self.config.output_dir}/valid_area.gpkg", driver="GPKG", layer="valid_area")
+        elif constraint.constraint_type == ConstraintType.PREFER_WITHIN:
+            self.prefer_areas.append((constraint.priority, constraint_gdf))
             
-        return True, score
+        # 合并有效区域
+        # self.valid_area = gpd.GeoDataFrame(geometry=unary_union(self.valid_area.geometry), crs=CRS)
+        
+
+    def get_valid_area(self) -> gpd.GeoDataFrame:
+        """返回有效区域，按优先级排序，优先级高的区域放到前面"""
+        if self.valid_area is None:
+            raise ValueError("没有设置任何约束条件")
+            
+        # 按优先级排序prefer_areas
+        self.prefer_areas.sort(key=lambda x: x[0])
+        
+        # 如果没有优先区域，直接返回有效区域
+        if not self.prefer_areas:
+            return self.valid_area.explode(ignore_index=True)
+            
+        # 创建分层的有效区域
+        layered_areas = []
+        remaining_area = self.valid_area.copy()
+        
+        # 按优先级处理每个prefer区域
+        for _, prefer_area in self.prefer_areas:
+            # 与当前剩余区域相交
+            current_layer = gpd.overlay(remaining_area, prefer_area, how='intersection')
+            if not current_layer.empty:
+                layered_areas.append(current_layer)
+            # 更新剩余区域
+            remaining_area = gpd.overlay(remaining_area, prefer_area, how='difference')
+            
+        # 添加剩余区域作为最后一层
+        if not remaining_area.empty:
+            layered_areas.append(remaining_area)
+            
+        # 合并所有层
+        return pd.concat(layered_areas, ignore_index=True).explode(ignore_index=True)
+    
+    def update_valid_area(self, excluded_area: gpd.GeoDataFrame):
+        """更新有效区域，去除已生成点的缓冲区"""
+        self.valid_area = gpd.overlay(self.valid_area, excluded_area, how='difference').explode(ignore_index=True)
+
 
 class GeoFeatureManager:
     """地理要素管理器"""
@@ -98,14 +131,14 @@ class GeoFeatureManager:
                     buffer_size: Optional[float] = None) -> gpd.GeoDataFrame:
         """读取地理要素"""
         try:
-            gdf = gpd.read_file(self.file,where=where,layer=layer).to_crs(3857)
+            gdf = gpd.read_file(self.file,where=where,layer=layer).to_crs(CRS)
             if buffer_size is not None:
                 # 对每个几何体单独进行buffer操作
                 gdf['geometry'] = gdf['geometry'].buffer(buffer_size)
             return gdf
         except Exception as e:
             print(f"读取图层 {layer} 失败: {e}")
-            return gpd.GeoDataFrame(geometry=[], crs=3857)
+            return gpd.GeoDataFrame(geometry=[], crs=CRS)
 
 class PointGenerator:
     """点位生成器"""
@@ -131,88 +164,81 @@ class PointGenerator:
     def create_hexagon(self, point: Tuple[float, float])->gpd.GeoDataFrame:
         pass
 
-
-    def get_random_point(self, search_area: gpd.GeoDataFrame) -> Optional[Point]:
-        # 获取每个多边形的面积
-        search_area=search_area.explode(ignore_index=True)
-        areas = search_area.area
-        total_area = areas.sum()
+    def create_circle(self, point: Tuple[float, float], radius: float)->gpd.GeoDataFrame:
+        return gpd.GeoDataFrame(
+            geometry=[point.buffer(radius)], 
+            crs=3857
+        )
         
-        attempts = 0
-        while attempts < self.config.max_attempts:
-            # 根据面积权重随机选择一个多边形
-            chosen_poly = search_area.iloc[np.random.choice(len(search_area), p=areas/total_area)]
-            bounds = chosen_poly.geometry.bounds
+        
+    def get_random_point(self, search_area: gpd.GeoDataFrame) -> Optional[Point]:
+        # 按照DataFrame的顺序处理，因为get_valid_area已经按优先级排序了
+        search_area = search_area.explode(ignore_index=True)
+        
+        # 从高优先级区域开始尝试
+        for idx in range(len(search_area)):
+            current_poly = search_area.iloc[idx]
+            bounds = current_poly.geometry.bounds
             
-            # 在选中的多边形范围内生成随机点
-            point = Point(random.uniform(bounds[0], bounds[2]), 
-                         random.uniform(bounds[1], bounds[3]))
-            
-            if chosen_poly.geometry.contains(point):
-                is_valid, _ = self.validator.validate(point)
-                if is_valid:
+            # 在当前多边形中尝试生成点
+            # local_attempts = min(1000, self.config.max_attempts // len(search_area))
+            while True:
+                point = Point(random.uniform(bounds[0], bounds[2]), 
+                             random.uniform(bounds[1], bounds[3]))
+                
+                if current_poly.geometry.contains(point):
                     return point
-            attempts += 1
+                
         return None
 
-    def generate(self)->gpd.GeoDataFrame:
+    def generate(self) -> gpd.GeoDataFrame:
         """生成点位"""
         try:
-            # 创建起始点
-            start_point = gpd.GeoDataFrame(
-                geometry=[Point(self.config.start_point)], 
-                crs=4326
-            ).to_crs(3857).geometry.iloc[0]
-
-            valid_points = [start_point]
-            union_area = self.create_ring(start_point)
+            valid_area = self.validator.get_valid_area()
+            valid_area.to_file(f"{self.config.output_dir}/valid_area1.gpkg", driver="GPKG", layer="valid_area")  
+            valid_points = []
             
-            with tqdm(total=self.config.target_points,initial=1) as pbar:
-                while len(valid_points) < self.config.target_points:
-                    new_point = self.get_random_point(union_area)
-                    if new_point is None:
-                        print(f"\n无法在第{len(valid_points)+1}次找到有效点位")
-                        break
-
-                    valid_points.append(new_point)
-                    new_ring = self.create_ring(new_point)
+            # 根据是否设置目标点位数创建不同格式的进度条
+            if self.config.target_points:
+                pbar = tqdm(
+                    total=self.config.target_points,
+                    desc="生成点位",
+                    bar_format='{desc}: {n_fmt}/{total_fmt} [{bar}] {percentage:3.0f}%'
+                )
+            else:
+                pbar = tqdm(
+                    desc="生成点位",
+                    bar_format='{desc}: {n_fmt} 个点位 [{bar}] {elapsed}',
+                    disable=False
+                )
+            
+            while not valid_area.empty:
+                if self.config.target_points and len(valid_points) >= self.config.target_points:
+                    break
                     
-                    # 先计算两个圆环的并集 
-                    temp_union = gpd.overlay(union_area, new_ring, how='union')
-                    # 合并相连的geometry
-                    temp_union = gpd.GeoDataFrame(geometry=[unary_union(temp_union.geometry)], crs=3857)
-                    # 计算两个内圈
-                    old_inner = gpd.GeoDataFrame(geometry=[Point(p).buffer(self.config.min_distance) for p in valid_points], crs=3857)
-                    new_inner = gpd.GeoDataFrame(geometry=[new_point.buffer(self.config.min_distance)], crs=3857)
-                    # 从并集中去除内圈区域
-                    union_area = gpd.overlay(temp_union, old_inner, how='difference',keep_geom_type=True)
-                    union_area = gpd.overlay(union_area, new_inner, how='difference',keep_geom_type=True)
-
-                    pbar.update(1)
-
-            # 保存结果
+                new_point = self.get_random_point(valid_area)
+                if new_point is None:
+                    print("\n无法在剩余区域中生成有效点位")
+                    break
+                    
+                valid_points.append(new_point)
+                new_circle = self.create_circle(new_point, self.config.min_distance)
+                self.validator.update_valid_area(new_circle)
+                valid_area = self.validator.get_valid_area()
+                
+                pbar.update(1)
+            
+            pbar.close()
+            print(f"\n成功生成 {len(valid_points)} 个点位")
+            valid_area.to_file(f"{self.config.output_dir}/valid_area.gpkg", driver="GPKG", layer="valid_area")  
             points_gdf = gpd.GeoDataFrame(geometry=valid_points, crs=3857)
-            union_area.to_crs(4326).to_file(
-                f"{self.config.output_dir}/union.gpkg",
-                driver="GPKG",
-                layer="union"
-            )
             return points_gdf.to_crs(4326)
-            # points_gdf.to_crs(4326).to_file(
-            #     f"{self.config.output_dir}/points.gpkg",
-            #     driver="GPKG",
-            #     layer="points"
-            # )
-            
-            
-            
-            # print(f"\n已生成 {len(valid_points)} 个点位")
-            
+                
         except Exception as e:
             print(f"生成点位错误: {e}")
-            return points_gdf.to_crs(4326)
+            return gpd.GeoDataFrame(geometry=valid_points, crs=3857).to_crs(4326)
         
-class FieldsAdd:
+class FieldsGenerator:
     def __init__(self, gdf: gpd.GeoDataFrame, config: GeneratorConfig):
         """
         初始化Fields管理器
@@ -245,7 +271,7 @@ class FieldsAdd:
         :param height_field: 高度字段名
         """
         if height_field not in height_gdf.columns:
-            raise ValueError(f"指定的字段 {height_field} 在高度数据中不存在")
+            raise ValueError(f"指定的字��� {height_field} 在高度数据中不存在")
 
         height_gdf = height_gdf.to_crs(self.gdf.crs)
         joined_gdf = gpd.sjoin(self.gdf, height_gdf, how="left", predicate="within")
@@ -278,27 +304,17 @@ class FieldsAdd:
         self.add_custom_fields()  # 添加其他自定义字段
         return self.gdf
 
-
-def category_num(value):
-    """
-    """
-    if value=="城区":
-        return 9
-    elif value == "县城":
-        return 6
-    elif value == "郊区":
-        return 4
-    elif value=="农村":
-        return 2
-    
+def equal_epsg(gdf1: gpd.GeoDataFrame, gdf2: gpd.GeoDataFrame)->bool:
+    """判断两个GeoDataFrame的坐标系是否相同"""
+    return gdf1.crs == gdf2.crs
+  
 def main():
     """主函数"""
     try:
         # 设置配置参数
         config = GeneratorConfig(
-            target_points=400,
-            output_dir="id-9",
-            start_point=(112.982318, 28.188614)
+            # target_points=200,
+            output_dir="雨花区-1",
         )
         
         # 初始化管理器和读取数据
@@ -323,7 +339,7 @@ def main():
         )
 
         authority_boundary = boundary.read_feature(
-            where="id=9"
+            where="name='雨花区'"
         )
 
         
@@ -345,30 +361,30 @@ def main():
                 authority_boundary,
                 ConstraintType.MUST_WITHIN
             ))
-        
+            
         if not roads.empty:
             validator.add_constraint(SpatialConstraint(
                 "必须远离道路",
                 roads,
                 ConstraintType.MUST_OUTSIDE
             ))
-        
+            
         if not water.empty:
             validator.add_constraint(SpatialConstraint(
                 "必须远离水体",
                 water,
                 ConstraintType.MUST_OUTSIDE
             ))
-        
+            
         # 创建并运行生成器
         print("开始生成点位...")
         generator = PointGenerator(config, validator)
         point_gdf = generator.generate()
 
-        field=FieldsAdd(point_gdf,config=config)
-        field.add_height(gpd.read_file("./osm_data/长沙-20241111-v2.gpkg"))
-        gdf=field.apply_fields()
-        gdf.to_crs(4326).to_file(
+        # field=FieldsGenerator(point_gdf,config=config)
+        # field.add_height(gpd.read_file("./osm_data/长沙-20241111-v2.gpkg"))
+        # gdf=field.apply_fields()
+        point_gdf.to_crs(4326).to_file(
                 f"{config.output_dir}/points.gpkg",
                 driver="GPKG",
                 layer="points"
@@ -381,3 +397,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
