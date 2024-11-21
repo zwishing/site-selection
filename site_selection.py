@@ -8,6 +8,7 @@ import geopandas as gpd
 import pandas as pd
 from tqdm import tqdm
 from shapely.ops import unary_union
+import numpy as np
 
 @dataclass
 class Fields:
@@ -18,8 +19,8 @@ class Fields:
 @dataclass
 class GeneratorConfig:
     """生成器配置"""
-    min_distance: float = 225 
-    max_distance: float = 575
+    min_distance: float = 230 
+    max_distance: float = 580
     max_attempts: int = 1000000
     target_points: int = 300
     start_point: Tuple[float, float] = (112.998061, 28.17708)
@@ -132,11 +133,22 @@ class PointGenerator:
 
 
     def get_random_point(self, search_area: gpd.GeoDataFrame) -> Optional[Point]:
-        minx, miny, maxx, maxy = search_area.total_bounds
+        # 获取每个多边形的面积
+        search_area=search_area.explode(ignore_index=True)
+        areas = search_area.area
+        total_area = areas.sum()
+        
         attempts = 0
         while attempts < self.config.max_attempts:
-            point = Point(random.uniform(minx, maxx), random.uniform(miny, maxy))
-            if search_area.contains(point).any():
+            # 根据面积权重随机选择一个多边形
+            chosen_poly = search_area.iloc[np.random.choice(len(search_area), p=areas/total_area)]
+            bounds = chosen_poly.geometry.bounds
+            
+            # 在选中的多边形范围内生成随机点
+            point = Point(random.uniform(bounds[0], bounds[2]), 
+                         random.uniform(bounds[1], bounds[3]))
+            
+            if chosen_poly.geometry.contains(point):
                 is_valid, _ = self.validator.validate(point)
                 if is_valid:
                     return point
@@ -284,7 +296,7 @@ def main():
     try:
         # 设置配置参数
         config = GeneratorConfig(
-            target_points=1112,
+            target_points=400,
             output_dir="id-9",
             start_point=(112.982318, 28.188614)
         )
