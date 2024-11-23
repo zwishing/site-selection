@@ -34,8 +34,8 @@ def main():
     # output_file = "长沙-v2.osm"
     # convert_shp_to_osm(input_path, output_file)
 
-    input_path = "./base/长沙lucc-v2.gpkg"
-    output_file = "./base/长沙lucc.osm"
+    input_path = "id-9/points.gpkg"
+    output_file = "id-9/points-id-9.osm"
     convert_shp_to_osm(input_path, output_file)
 
 
